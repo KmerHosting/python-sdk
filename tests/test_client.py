@@ -92,6 +92,21 @@ class ClientTests(unittest.TestCase):
         self.assertEqual(urlopen.call_count, 42)
 
     @patch("kmerhosting.client.urllib.request.urlopen")
+    def test_domain_search_uses_public_service_without_api_key(self, urlopen):
+        urlopen.return_value = FakeResponse({"results": [{"domainName": "example.com"}, {"domainName": "example.cm"}]})
+        client = KmerHostingClient(api_key="kh_live_test", domain_search_url="https://domain.example.test/")
+        result = client.domains.search(["example.com", " example.cm "])
+        self.assertEqual(len(result["results"]), 2)
+        request = urlopen.call_args.args[0]
+        self.assertEqual(request.get_method(), "GET")
+        self.assertEqual(request.full_url, "https://domain.example.test/api/domain-search?domains=example.com%2Cexample.cm")
+        self.assertIsNone(request.get_header("Authorization"))
+        with self.assertRaises(ValueError):
+            client.domains.search([])
+        with self.assertRaises(ValueError):
+            client.domains.search([f"d{i}.com" for i in range(21)])
+
+    @patch("kmerhosting.client.urllib.request.urlopen")
     def test_preserves_structured_api_errors(self, urlopen):
         error_body = {"error": {"code": "insufficient_scope", "message": "The scope is missing.", "request_id": "request-1"}}
         error = HTTPError("https://example.test/v1/account", 403, "Forbidden", {"X-Request-Id": "header-request"}, None)

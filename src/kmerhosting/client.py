@@ -81,6 +81,19 @@ class _DomainsResource(_Resource):
     def set_nameservers(self, domain_id: str, name_servers: list[str], idempotency_key: Optional[str] = None) -> Json:
         return self._client._mutate("PUT", f"/v1/domains/{_encode(domain_id)}/nameservers", {"nameServers": name_servers}, idempotency_key)
 
+    def search(self, domains: "str | list[str]") -> Json:
+        """Check availability and price of 1 to 20 domains.
+
+        Public endpoint on domain.kmerhosting.com: no API key is sent. Limited to 20 requests
+        per IP per minute (a bulk search counts once). Returns {"results": [...]}.
+        """
+        items = [domains] if isinstance(domains, str) else list(domains)
+        items = [item.strip() for item in items if item and item.strip()]
+        if not 1 <= len(items) <= 20:
+            raise ValueError("Pass between 1 and 20 domains to domains.search.")
+        query = urllib.parse.urlencode({"domains": ",".join(items)})
+        return self._client._request("GET", f"/api/domain-search?{query}", base_url=self._client.domain_search_url, authenticated=False)
+
 
 class _EmailResource(_Resource):
     def list_services(self) -> Json:
@@ -198,11 +211,18 @@ class _KvmResource(_Resource):
 class KmerHostingClient:
     """A synchronous client. It never stores or logs API credentials."""
 
-    def __init__(self, api_key: Optional[str] = None, base_url: str = "https://api.kmerhosting.com", timeout: float = 30.0) -> None:
+    def __init__(
+        self,
+        api_key: Optional[str] = None,
+        base_url: str = "https://api.kmerhosting.com",
+        timeout: float = 30.0,
+        domain_search_url: str = "https://domain.kmerhosting.com",
+    ) -> None:
         self.api_key = api_key or os.environ.get("KMERHOSTING_API_KEY")
         if not self.api_key:
             raise ValueError("Set KMERHOSTING_API_KEY or pass api_key to KmerHostingClient.")
         self.base_url = base_url.rstrip("/")
+        self.domain_search_url = domain_search_url.rstrip("/")
         self.timeout = timeout
         self.account = _AccountResource(self)
         self.services = _ServicesResource(self)
@@ -215,15 +235,25 @@ class KmerHostingClient:
     def _mutate(self, method: str, path: str, body: Optional[Mapping[str, Any]], idempotency_key: Optional[str]) -> Json:
         return self._request(method, path, body, idempotency_key or str(uuid.uuid4()))
 
-    def _request(self, method: str, path: str, body: Optional[Mapping[str, Any]] = None, idempotency_key: Optional[str] = None) -> Json:
-        headers = {"Accept": "application/json", "Authorization": f"Bearer {self.api_key}"}
+    def _request(
+        self,
+        method: str,
+        path: str,
+        body: Optional[Mapping[str, Any]] = None,
+        idempotency_key: Optional[str] = None,
+        base_url: Optional[str] = None,
+        authenticated: bool = True,
+    ) -> Json:
+        headers = {"Accept": "application/json"}
+        if authenticated:
+            headers["Authorization"] = f"Bearer {self.api_key}"
         data = None
         if body is not None:
             headers["Content-Type"] = "application/json"
             data = json.dumps(body).encode("utf-8")
         if idempotency_key:
             headers["Idempotency-Key"] = idempotency_key
-        request = urllib.request.Request(f"{self.base_url}{path}", data=data, headers=headers, method=method)
+        request = urllib.request.Request(f"{base_url or self.base_url}{path}", data=data, headers=headers, method=method)
         try:
             with urllib.request.urlopen(request, timeout=self.timeout) as response:
                 return self._decode(response.read())
