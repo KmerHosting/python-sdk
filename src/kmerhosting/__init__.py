@@ -1,3 +1,3 @@
-from .client import KmerHostingClient, KmerHostingError
+from .client import KmerHostingClient, KmerHostingError, RateLimitError
 
-__all__ = ["KmerHostingClient", "KmerHostingError"]
+__all__ = ["KmerHostingClient", "KmerHostingError", "RateLimitError"]
