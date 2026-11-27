@@ -3,7 +3,7 @@ import unittest
 from unittest.mock import patch
 from urllib.error import HTTPError
 
-from kmerhosting import KmerHostingClient, KmerHostingError
+from kmerhosting import KmerHostingClient, KmerHostingError, RateLimitError
 
 
 ID = "22222222-2222-4222-8222-222222222222"
@@ -133,12 +133,69 @@ class ClientTests(unittest.TestCase):
         error = HTTPError("https://example.test/v1/account", 502, "Bad Gateway", {}, None)
         error.read = lambda: b"upstream unavailable"
         urlopen.side_effect = error
-        client = KmerHostingClient(api_key="kh_live_test", base_url="https://example.test")
+        client = KmerHostingClient(api_key="kh_live_test", base_url="https://example.test", max_attempts=1)
 
         with self.assertRaises(KmerHostingError) as raised:
             client.account.get()
         self.assertEqual(raised.exception.status, 502)
         self.assertEqual(raised.exception.code, "request_failed")
+
+
+def _http_error(status, headers=None, payload=None):
+    error = HTTPError("https://example.test/v1/account", status, "x", headers or {}, None)
+    body = json.dumps(payload or {"error": {"code": "rate_limit_exceeded", "message": "slow down", "request_id": "r1"}}).encode()
+    error.read = lambda: body
+    return error
+
+
+class RetryTests(unittest.TestCase):
+    def make(self, **kwargs):
+        self.waits = []
+        return KmerHostingClient(api_key="kh_live_test", base_url="https://example.test", sleep=self.waits.append, **kwargs)
+
+    @patch("kmerhosting.client.urllib.request.urlopen")
+    def test_retries_429_with_retry_after_and_same_idempotency_key(self, urlopen):
+        limited = {"Retry-After": "2", "X-RateLimit-Limit": "60", "X-RateLimit-Remaining": "0"}
+        urlopen.side_effect = [_http_error(429, limited), _http_error(429, {"Retry-After": "1"}), FakeResponse()]
+        client = self.make()
+        client.kvm.action(ID, "restart")
+        self.assertEqual(urlopen.call_count, 3)
+        keys = {call.args[0].get_header("Idempotency-key") for call in urlopen.call_args_list}
+        self.assertEqual(len(keys), 1)
+        self.assertGreaterEqual(self.waits[0], 2.0)
+        self.assertGreaterEqual(self.waits[1], 1.0)
+        self.assertLess(self.waits[1], 2.0)
+
+    @patch("kmerhosting.client.urllib.request.urlopen")
+    def test_retries_gateway_errors_with_bounded_backoff(self, urlopen):
+        urlopen.side_effect = [_http_error(502, payload={}), _http_error(503, payload={}), FakeResponse()]
+        self.make().account.get()
+        self.assertEqual(urlopen.call_count, 3)
+        self.assertLessEqual(self.waits[0], 0.5)
+        self.assertLessEqual(self.waits[1], 1.0)
+
+    @patch("kmerhosting.client.urllib.request.urlopen")
+    def test_raises_rate_limit_error_with_retry_after(self, urlopen):
+        urlopen.side_effect = lambda *a, **k: (_ for _ in ()).throw(_http_error(429, {"Retry-After": "7", "X-RateLimit-Limit": "60", "X-RateLimit-Remaining": "0"}))
+        with self.assertRaises(RateLimitError) as raised:
+            self.make().account.get()
+        self.assertEqual(urlopen.call_count, 3)
+        self.assertEqual(raised.exception.retry_after, 7.0)
+        self.assertEqual(raised.exception.limit, 60)
+        self.assertEqual(raised.exception.code, "rate_limit_exceeded")
+        self.assertIsInstance(raised.exception, KmerHostingError)
+
+    @patch("kmerhosting.client.urllib.request.urlopen")
+    def test_does_not_retry_other_errors_and_can_be_disabled(self, urlopen):
+        urlopen.side_effect = _http_error(403, payload={"error": {"code": "insufficient_scope", "message": "no"}})
+        with self.assertRaises(KmerHostingError):
+            self.make().account.get()
+        self.assertEqual(urlopen.call_count, 1)
+        urlopen.reset_mock()
+        urlopen.side_effect = lambda *a, **k: (_ for _ in ()).throw(_http_error(429, {"Retry-After": "1"}))
+        with self.assertRaises(RateLimitError):
+            self.make(max_attempts=1).account.get()
+        self.assertEqual(urlopen.call_count, 1)
 
 
 if __name__ == "__main__":

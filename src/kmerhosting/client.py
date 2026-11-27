@@ -4,11 +4,15 @@ from __future__ import annotations
 
 import json
 import os
+import random
+import time
 import urllib.error
 import urllib.parse
 import urllib.request
 import uuid
-from typing import Any, Mapping, Optional
+from datetime import datetime, timezone
+from email.utils import parsedate_to_datetime
+from typing import Any, Callable, Mapping, Optional
 
 
 Json = Mapping[str, Any]
@@ -23,6 +27,52 @@ class KmerHostingError(RuntimeError):
         self.code = code
         self.request_id = request_id
         self.body = body
+
+
+class RateLimitError(KmerHostingError):
+    """HTTP 429. ``retry_after`` is the server-suggested wait in seconds, when sent."""
+
+    def __init__(
+        self,
+        message: str,
+        code: str,
+        request_id: Optional[str] = None,
+        body: Any = None,
+        retry_after: Optional[float] = None,
+        limit: Optional[int] = None,
+        remaining: Optional[int] = None,
+    ) -> None:
+        super().__init__(message, 429, code, request_id, body)
+        self.retry_after = retry_after
+        self.limit = limit
+        self.remaining = remaining
+
+
+_RETRYABLE_STATUSES = frozenset({429, 502, 503, 504})
+
+
+def _parse_retry_after(value: Optional[str]) -> Optional[float]:
+    if not value:
+        return None
+    try:
+        seconds = float(value)
+        return seconds if seconds >= 0 else None
+    except ValueError:
+        pass
+    try:
+        when = parsedate_to_datetime(value)
+    except (TypeError, ValueError):
+        return None
+    if when.tzinfo is None:
+        when = when.replace(tzinfo=timezone.utc)
+    return max(0.0, (when - datetime.now(timezone.utc)).total_seconds())
+
+
+def _parse_int(value: Optional[str]) -> Optional[int]:
+    try:
+        return int(value) if value not in (None, "") else None
+    except ValueError:
+        return None
 
 
 def _encode(value: str) -> str:
@@ -217,13 +267,22 @@ class KmerHostingClient:
         base_url: str = "https://api.kmerhosting.com",
         timeout: float = 30.0,
         domain_search_url: str = "https://domain.kmerhosting.com",
+        max_attempts: int = 3,
+        retry_base_delay: float = 0.5,
+        retry_max_delay: float = 60.0,
+        sleep: Callable[[float], None] = time.sleep,
     ) -> None:
+        """``max_attempts`` is the total number of tries for 429/502/503/504 (1 disables retries)."""
         self.api_key = api_key or os.environ.get("KMERHOSTING_API_KEY")
         if not self.api_key:
             raise ValueError("Set KMERHOSTING_API_KEY or pass api_key to KmerHostingClient.")
         self.base_url = base_url.rstrip("/")
         self.domain_search_url = domain_search_url.rstrip("/")
         self.timeout = timeout
+        self.max_attempts = max(1, int(max_attempts))
+        self.retry_base_delay = retry_base_delay
+        self.retry_max_delay = retry_max_delay
+        self._sleep = sleep
         self.account = _AccountResource(self)
         self.services = _ServicesResource(self)
         self.domains = _DomainsResource(self)
@@ -253,22 +312,51 @@ class KmerHostingClient:
             data = json.dumps(body).encode("utf-8")
         if idempotency_key:
             headers["Idempotency-Key"] = idempotency_key
-        request = urllib.request.Request(f"{base_url or self.base_url}{path}", data=data, headers=headers, method=method)
-        try:
-            with urllib.request.urlopen(request, timeout=self.timeout) as response:
-                return self._decode(response.read())
-        except urllib.error.HTTPError as error:
-            payload = self._decode(error.read())
-            details = payload.get("error", {}) if isinstance(payload, Mapping) else {}
-            raise KmerHostingError(
-                str(details.get("message") or f"KmerHosting API request failed with status {error.code}."),
-                error.code,
-                str(details.get("code") or "request_failed"),
-                details.get("request_id") or error.headers.get("X-Request-Id"),
+        url = f"{base_url or self.base_url}{path}"
+        attempt = 1
+        while True:
+            # A fresh Request per attempt, but the same headers (including Idempotency-Key).
+            request = urllib.request.Request(url, data=data, headers=headers, method=method)
+            try:
+                with urllib.request.urlopen(request, timeout=self.timeout) as response:
+                    return self._decode(response.read())
+            except urllib.error.HTTPError as error:
+                payload = self._decode(error.read())
+                if error.code in _RETRYABLE_STATUSES and attempt < self.max_attempts:
+                    self._sleep(self._retry_delay(attempt, _parse_retry_after(error.headers.get("Retry-After"))))
+                    attempt += 1
+                    continue
+                raise self._error_for(error, payload) from error
+            except urllib.error.URLError as error:
+                raise KmerHostingError("Unable to reach the KmerHosting API.", 0, "connection_failed") from error
+
+    def _retry_delay(self, attempt: int, retry_after: Optional[float]) -> float:
+        if retry_after is not None:
+            delay = retry_after + random.uniform(0, 0.25)
+        else:
+            delay = random.uniform(0, min(self.retry_max_delay, self.retry_base_delay * 2 ** (attempt - 1)))
+        return min(self.retry_max_delay, delay)
+
+    @staticmethod
+    def _error_for(error: urllib.error.HTTPError, payload: Any) -> KmerHostingError:
+        body = payload if isinstance(payload, Mapping) else {}
+        details = body.get("error", {})
+        if not isinstance(details, Mapping):
+            # The public domain-search service answers {"error": "<code>", "message": "..."}.
+            details = {"code": details, "message": body.get("message")}
+        message = str(details.get("message") or f"KmerHosting API request failed with status {error.code}.")
+        request_id = details.get("request_id") or error.headers.get("X-Request-Id")
+        if error.code == 429:
+            return RateLimitError(
+                str(details.get("message") or "KmerHosting API rate limit exceeded."),
+                str(details.get("code") or "rate_limit_exceeded"),
+                request_id,
                 payload,
-            ) from error
-        except urllib.error.URLError as error:
-            raise KmerHostingError("Unable to reach the KmerHosting API.", 0, "connection_failed") from error
+                _parse_retry_after(error.headers.get("Retry-After")),
+                _parse_int(error.headers.get("X-RateLimit-Limit")),
+                _parse_int(error.headers.get("X-RateLimit-Remaining")),
+            )
+        return KmerHostingError(message, error.code, str(details.get("code") or "request_failed"), request_id, payload)
 
     @staticmethod
     def _decode(raw: bytes) -> Json:
